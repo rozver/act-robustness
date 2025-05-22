@@ -86,6 +86,7 @@ def main(args):
         'task_name': task_name,
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
+        'rm_outliers': args['rm_outliers'],
         'camera_names': camera_names,
         'real_robot': not is_sim
     }
@@ -152,6 +153,8 @@ def get_image(ts, camera_names):
     curr_image = torch.from_numpy(curr_image / 255.0).float().unsqueeze(0)
     curr_image.to(device)
     return curr_image
+
+
 
 
 def eval_bc(config, ckpt_name, save_episode=True):
@@ -262,6 +265,11 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         actions_for_curr_step = all_time_actions[:, t]
                         actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
                         actions_for_curr_step = actions_for_curr_step[actions_populated]
+                        
+                        # HERE WE ADD OUTLIER DETECTION!
+                        if rm_outliers:
+                            print('hehe')
+                            
                         k = 0.01
                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
                         exp_weights = exp_weights / exp_weights.sum()
@@ -446,5 +454,6 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+    parser.add_argument('--rm_outliers', action='store_true')
     
     main(vars(parser.parse_args()))
