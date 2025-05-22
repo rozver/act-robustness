@@ -21,6 +21,8 @@ from sim_env import BOX_POSE
 import IPython
 e = IPython.embed
 
+device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+
 def main(args):
     set_seed(1)
     # command line parameters
@@ -144,9 +146,7 @@ def get_image(ts, camera_names):
         curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
         curr_images.append(curr_image)
     curr_image = np.stack(curr_images, axis=0)
-    curr_image = torch.from_numpy(curr_image / 255.0).float().unsqueeze(0)
-    if torch.cuda.is_available():
-        curr_image = curr_image.cuda()
+    curr_image = torch.from_numpy(curr_image / 255.0).float().to(device).unsqueeze(0)
     return curr_image
 
 
@@ -167,13 +167,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
-    if torch.cuda.is_available():
-        loading_status = policy.load_state_dict(torch.load(ckpt_path))
-    else:
-        loading_status = policy.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
+    loading_status = policy.load_state_dict(torch.load(ckpt_path, map_location=device))
     print(loading_status)
-    if torch.cuda.is_available():
-        policy.cuda()
+    policy.to(device)
     policy.eval()
     print(f'Loaded: {ckpt_path}')
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
@@ -222,13 +218,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
         ### evaluation loop
         if temporal_agg:
-            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim])
-            if torch.cuda.is_available():
-                all_time_actions = all_time_actions.cuda()
+            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).to(device)
 
-        qpos_history = torch.zeros((1, max_timesteps, state_dim))
-        if torch.cuda.is_available():
-            qpos_history = qpos_history.cuda()
+        qpos_history = torch.zeros((1, max_timesteps, state_dim)).to(device)
         image_list = [] # for visualization
         qpos_list = []
         target_qpos_list = []
@@ -249,9 +241,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     image_list.append({'main': obs['image']})
                 qpos_numpy = np.array(obs['qpos'])
                 qpos = pre_process(qpos_numpy)
-                qpos = torch.from_numpy(qpos).float().unsqueeze(0)
-                if torch.cuda.is_available():
-                    qpos = qpos.cuda()
+                qpos = torch.from_numpy(qpos).float().to(device).unsqueeze(0)
                 qpos_history[:, t] = qpos
                 curr_image = get_image(ts, camera_names)
 
@@ -264,12 +254,14 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         actions_for_curr_step = all_time_actions[:, t]
                         actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
                         actions_for_curr_step = actions_for_curr_step[actions_populated]
-                        k = 0.01
+                        
+                        # Remove outliers before calculating weighted average
+                        actions_for_curr_step = remove_outliers(actions_for_curr_step, threshold=2.0)  # More lenient outlier removal
+                        
+                        k = 0.005  # Slower decay for more temporal smoothing
                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
                         exp_weights = exp_weights / exp_weights.sum()
-                        exp_weights = torch.from_numpy(exp_weights).unsqueeze(dim=1)
-                        if torch.cuda.is_available():
-                            exp_weights = exp_weights.cuda()
+                        exp_weights = torch.from_numpy(exp_weights.astype(np.float32)).to(device).unsqueeze(dim=1)
                         raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
                     else:
                         raw_action = all_actions[:, t % query_frequency]
@@ -329,11 +321,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 def forward_pass(data, policy):
     image_data, qpos_data, action_data, is_pad = data
-    if torch.cuda.is_available():
-        image_data = image_data.cuda()
-        qpos_data = qpos_data.cuda()
-        action_data = action_data.cuda()
-        is_pad = is_pad.cuda()
+    image_data, qpos_data, action_data, is_pad = image_data.to(device), qpos_data.to(device), action_data.to(device), is_pad.to(device)
     return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
 
 
@@ -347,9 +335,7 @@ def train_bc(train_dataloader, val_dataloader, config):
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
-    if torch.cuda.is_available():
-        policy.cuda()
-
+    policy.to(device)
     optimizer = make_optimizer(policy_class, policy)
 
     train_history = []
@@ -431,6 +417,36 @@ def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
         plt.title(key)
         plt.savefig(plot_path)
     print(f'Saved plots to {ckpt_dir}')
+
+
+def remove_outliers(actions, threshold=1.5):
+    """
+    Remove outliers from a tensor of actions using the IQR method.
+    Args:
+        actions: Tensor of shape [N, action_dim]
+        threshold: IQR multiplier for outlier detection (default: 1.5)
+    Returns:
+        Tensor of shape [M, action_dim] where M <= N, containing only non-outlier actions
+    """
+    if len(actions) <= 2:  # Need at least 3 actions to detect outliers
+        return actions
+        
+    # Calculate L2 norms of each action
+    action_norms = torch.norm(actions, dim=1)
+    
+    # Calculate IQR
+    q1 = torch.quantile(action_norms, 0.25)
+    q3 = torch.quantile(action_norms, 0.75)
+    iqr = q3 - q1
+    
+    # Define bounds
+    lower_bound = q1 - threshold * iqr
+    upper_bound = q3 + threshold * iqr
+    
+    # Find non-outlier indices
+    non_outlier_mask = (action_norms >= lower_bound) & (action_norms <= upper_bound)
+
+    return actions[non_outlier_mask]
 
 
 if __name__ == '__main__':
