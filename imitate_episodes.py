@@ -21,6 +21,8 @@ from sim_env import BOX_POSE
 import IPython
 e = IPython.embed
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
+
 def main(args):
     set_seed(1)
     # command line parameters
@@ -101,6 +103,9 @@ def main(args):
         exit()
 
     train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
+    train_dataloader = train_dataloader.to(device)
+    val_dataloader = val_dataloader.to(device)
+    stats = stats.to(device)
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -145,8 +150,7 @@ def get_image(ts, camera_names):
         curr_images.append(curr_image)
     curr_image = np.stack(curr_images, axis=0)
     curr_image = torch.from_numpy(curr_image / 255.0).float().unsqueeze(0)
-    if torch.cuda.is_available():
-        curr_image = curr_image.cuda()
+    curr_image.to(device)
     return curr_image
 
 
@@ -167,13 +171,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
-    if torch.cuda.is_available():
-        loading_status = policy.load_state_dict(torch.load(ckpt_path))
-    else:
-        loading_status = policy.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
+    loading_status = policy.load_state_dict(torch.load(ckpt_path, map_location=device))
     print(loading_status)
-    if torch.cuda.is_available():
-        policy.cuda()
+    policy = policy.to(device)
     policy.eval()
     print(f'Loaded: {ckpt_path}')
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
@@ -223,12 +223,10 @@ def eval_bc(config, ckpt_name, save_episode=True):
         ### evaluation loop
         if temporal_agg:
             all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim])
-            if torch.cuda.is_available():
-                all_time_actions = all_time_actions.cuda()
+            all_time_actions = all_time_actions.to(device)
 
         qpos_history = torch.zeros((1, max_timesteps, state_dim))
-        if torch.cuda.is_available():
-            qpos_history = qpos_history.cuda()
+        qpos_history = qpos_history.to(device)
         image_list = [] # for visualization
         qpos_list = []
         target_qpos_list = []
@@ -250,10 +248,10 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 qpos_numpy = np.array(obs['qpos'])
                 qpos = pre_process(qpos_numpy)
                 qpos = torch.from_numpy(qpos).float().unsqueeze(0)
-                if torch.cuda.is_available():
-                    qpos = qpos.cuda()
+                qpos = qpos.to(device)
                 qpos_history[:, t] = qpos
                 curr_image = get_image(ts, camera_names)
+                curr_image = curr_image.to(device)
 
                 ### query policy
                 if config['policy_class'] == "ACT":
@@ -268,8 +266,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
                         exp_weights = exp_weights / exp_weights.sum()
                         exp_weights = torch.from_numpy(exp_weights).unsqueeze(dim=1)
-                        if torch.cuda.is_available():
-                            exp_weights = exp_weights.cuda()
+                        exp_weights = exp_weights.to(device)
                         raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
                     else:
                         raw_action = all_actions[:, t % query_frequency]
@@ -329,11 +326,10 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 def forward_pass(data, policy):
     image_data, qpos_data, action_data, is_pad = data
-    if torch.cuda.is_available():
-        image_data = image_data.cuda()
-        qpos_data = qpos_data.cuda()
-        action_data = action_data.cuda()
-        is_pad = is_pad.cuda()
+    image_data = image_data.to(device)
+    qpos_data = qpos_data.to(device)
+    action_data = action_data.to(device)
+    is_pad = is_pad.to(device)
     return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
 
 
@@ -347,8 +343,7 @@ def train_bc(train_dataloader, val_dataloader, config):
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
-    if torch.cuda.is_available():
-        policy.cuda()
+    policy.to(device)
 
     optimizer = make_optimizer(policy_class, policy)
 
