@@ -265,6 +265,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
                         actions_for_curr_step = actions_for_curr_step[actions_populated]
                         k = 0.01
+                        # Remove outliers before calculating weighted average
+                        actions_for_curr_step = remove_outliers(actions_for_curr_step, threshold=2.0)  # More lenient outlier removal
+
                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
                         exp_weights = exp_weights / exp_weights.sum()
                         exp_weights = torch.from_numpy(exp_weights).unsqueeze(dim=1)
@@ -432,6 +435,34 @@ def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
         plt.savefig(plot_path)
     print(f'Saved plots to {ckpt_dir}')
 
+		
+def remove_outliers(actions, threshold=1.5):
+    """
+    Remove outliers from a tensor of actions using the IQR method.
+    Args:
+        actions: Tensor of shape [N, action_dim]
+        threshold: IQR multiplier for outlier detection (default: 1.5)
+    Returns:
+        Tensor of shape [M, action_dim] where M <= N, containing only non-outlier actions
+    """
+    if len(actions) <= 2:  # Need at least 3 actions to detect outliers
+        return actions
+        
+    # Calculate L2 norms of each action
+    action_norms = torch.norm(actions, dim=1)
+    
+    # Calculate IQR
+    q1 = torch.quantile(action_norms, 0.25)
+    q3 = torch.quantile(action_norms, 0.75)
+    iqr = q3 - q1
+    
+    # Define bounds
+    lower_bound = q1 - threshold * iqr
+    upper_bound = q3 + threshold * iqr
+    
+    # Find non-outlier indices
+    non_outlier_mask = (action_norms >= lower_bound) & (action_norms <= upper_bound)
+    return actions[non_outlier_mask]
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
