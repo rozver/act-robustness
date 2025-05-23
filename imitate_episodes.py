@@ -34,6 +34,7 @@ def main(args):
     batch_size_train = args['batch_size']
     batch_size_val = args['batch_size']
     num_epochs = args['num_epochs']
+    rm_outliers = args.get('rm_outliers', False)  # Get rm_outliers with default False
 
     # get task parameters
     is_sim = task_name[:4] == 'sim_'
@@ -85,11 +86,10 @@ def main(args):
         'policy_config': policy_config,
         'task_name': task_name,
         'seed': args['seed'],
-        'temporal_agg': args['temporal_agg'],
-        'rm_outliers': args['rm_outliers'],
+        'temporal_agg': args.get('temporal_agg', False),
+        'rm_outliers': rm_outliers,  # Add rm_outliers to config
         'camera_names': camera_names,
         'real_robot': not is_sim
-        
     }
 
     if is_eval:
@@ -269,7 +269,49 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         
                         # HERE WE ADD OUTLIER DETECTION!
                         if rm_outliers:
-                            print('hehe')
+                            # Convert to numpy for easier computation
+                            actions_np = actions_for_curr_step.cpu().numpy()
+                            
+                            # Calculate Mahalanobis distance for each action
+                            mean = np.mean(actions_np, axis=0)
+                            cov = np.cov(actions_np.T)
+                            try:
+                                inv_cov = np.linalg.inv(cov)
+                                mahalanobis_dist = np.array([np.sqrt((x - mean).T @ inv_cov @ (x - mean)) for x in actions_np])
+                                
+                                # Calculate IQR for Mahalanobis distances
+                                q1 = np.percentile(mahalanobis_dist, 25)
+                                q3 = np.percentile(mahalanobis_dist, 75)
+                                iqr = q3 - q1
+                                lower_bound = q1 - 1.5 * iqr
+                                upper_bound = q3 + 1.5 * iqr
+                                
+                                # Keep actions within bounds
+                                mask = (mahalanobis_dist >= lower_bound) & (mahalanobis_dist <= upper_bound)
+                                actions_for_curr_step = actions_for_curr_step[mask]
+                                
+                                if len(actions_for_curr_step) == 0:
+                                    # If all actions are outliers, use the mean
+                                    actions_for_curr_step = torch.from_numpy(mean).unsqueeze(0).to(device)
+                            except np.linalg.LinAlgError:
+                                # If covariance matrix is singular, use simple Euclidean distance
+                                mean = np.mean(actions_np, axis=0)
+                                euclidean_dist = np.array([np.linalg.norm(x - mean) for x in actions_np])
+                                
+                                # Calculate IQR for Euclidean distances
+                                q1 = np.percentile(euclidean_dist, 25)
+                                q3 = np.percentile(euclidean_dist, 75)
+                                iqr = q3 - q1
+                                lower_bound = q1 - 1.5 * iqr
+                                upper_bound = q3 + 1.5 * iqr
+                                
+                                # Keep actions within bounds
+                                mask = (euclidean_dist >= lower_bound) & (euclidean_dist <= upper_bound)
+                                actions_for_curr_step = actions_for_curr_step[mask]
+                                
+                                if len(actions_for_curr_step) == 0:
+                                    # If all actions are outliers, use the mean
+                                    actions_for_curr_step = torch.from_numpy(mean).unsqueeze(0).to(device)
                             
                         k = 0.01
                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))

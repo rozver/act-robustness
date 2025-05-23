@@ -78,12 +78,62 @@ To train ACT:
     --seed 0
 
 
-To evaluate the policy, run the same command but add ``--eval``. This loads the best validation checkpoint.
-The success rate should be around 90% for transfer cube, and around 50% for insertion.
-To enable temporal ensembling, add flag ``--temporal_agg``.
-Videos will be saved to ``<ckpt_dir>`` for each rollout.
-You can also add ``--onscreen_render`` to see real-time rendering during evaluation.
+### Evaluation
 
-For real-world data where things can be harder to model, train for at least 5000 epochs or 3-4 times the length after the loss has plateaued.
-Please refer to [tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing) for more info.
+To evaluate a trained policy, use the following commands with the `--eval` flag. This will load the best validation checkpoint and run 50 evaluation episodes.
 
+#### Transfer Cube (Scripted)
+```bash
+python imitate_episodes.py \
+  --eval \
+  --policy_class ACT \
+  --task_name sim_transfer_cube_scripted \
+  --batch_size 16 \
+  --seed 1 \
+  --num_epochs 500 \
+  --lr 1e-4 \
+  --ckpt_dir /Users/viviencheng/Desktop/weights/sim_transfer_cube_scripted \
+  --kl_weight 1 \
+  --chunk_size 100 \
+  --hidden_dim 512 \
+  --dim_feedforward 3200
+```
+
+#### Insertion (Scripted)
+```bash
+python imitate_episodes.py \
+  --eval \
+  --policy_class ACT \
+  --task_name sim_insertion_scripted \
+  --batch_size 16 \
+  --seed 1 \
+  --num_epochs 500 \
+  --lr 1e-4 \
+  --ckpt_dir /Users/viviencheng/Desktop/weights/sim_insertion_scripted \
+  --kl_weight 1 \
+  --chunk_size 100 \
+  --hidden_dim 512 \
+  --dim_feedforward 3200
+```
+
+#### Transfer Cube (Human)
+```bash
+python imitate_episodes.py \
+  --eval \
+  --policy_class ACT \
+  --task_name sim_transfer_cube_human \
+  --batch_size 16 \
+  --seed 1 \
+  --num_epochs 500 \
+  --lr 1e-4 \
+  --ckpt_dir /Users/viviencheng/Desktop/weights/sim_transfer_cube_human \
+  --kl_weight 1 \
+  --chunk_size 100 \
+  --hidden_dim 512 \
+  --dim_feedforward 3200
+```
+
+Additional evaluation options:
+- Add `--temporal_agg` to enable temporal ensembling
+- Add `--onscreen_render` to see real-time rendering during evaluation
+- Add `--rm_outliers` to remove outlier actions during evaluation
