@@ -15,6 +15,7 @@ from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from policy import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
+from outlier_visualizer import get_subtask_boundaries
 
 from sim_env import BOX_POSE
 
@@ -171,6 +172,13 @@ def eval_bc(config, ckpt_name, save_episode=True):
     outlier_kmeans = config['outlier_kmeans']
     iqr_threshold = config['iqr_threshold']
 
+    # Initialize visualizer if using MBIS outlier detection
+    if outlier_mbis:
+        from outlier_visualizer import OutlierVisualizer
+        visualizer = OutlierVisualizer(os.path.join(ckpt_dir, 'visualizations'))
+        visualizer.set_threshold(iqr_threshold)
+        subtask_boundaries = get_subtask_boundaries(task_name)
+
     onscreen_cam = 'angle'
 
     # load policy and stats
@@ -269,9 +277,44 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
                         #temporal agg quantile outlier removal 
                         if outlier_mbis:
-                            actions_for_curr_step_new = remove_outliers_mbis(actions_for_curr_step, threshold=iqr_threshold, weighted=True)
-                            #if len(actions_for_curr_step_new) < len(actions_for_curr_step):
-                                #print(len(actions_for_curr_step_new), len(actions_for_curr_step))
+                            # Calculate Mahalanobis distances and collect data for visualization
+                            N, d = actions_for_curr_step.shape
+                            if N > 1:
+                                k = 0.08
+                                exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
+                                exp_weights = exp_weights / exp_weights.sum()
+                                exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+
+                                #calculate mean per action over batch
+                                mu = (actions_for_curr_step * exp_weights).sum(dim=0)
+
+                                #calculate covariance matrix
+                                X = actions_for_curr_step - mu
+                                cov = (X * exp_weights).T @ X
+                                cov += torch.eye(d).cuda() * 1e-6 # for stability
+                                inv_cov = torch.linalg.inv(cov)
+
+                                #mahalanobis dist
+                                diff = X.unsqueeze(1)               # [N, 1, d]
+                                left = diff @ inv_cov                # [N, 1, d]
+                                mbis_dists = (left * diff).sum(dim=(1,2))  # [N]
+                                
+                                q1, q3 = torch.quantile(mbis_dists, 0.25), torch.quantile(mbis_dists, 0.75)
+                                iqr = q3 - q1
+                                mask = (mbis_dists >= q1 - iqr_threshold*iqr) & (mbis_dists <= q3 + iqr_threshold*iqr)
+                                
+                                # Collect data for visualization
+                                visualizer.collect_timestep_data(
+                                    mbis_dists,
+                                    torch.where(~mask)[0],
+                                    q1.item(),
+                                    q3.item(),
+                                    iqr.item()
+                                )
+                                
+                                actions_for_curr_step_new = actions_for_curr_step[mask]
+                            else:
+                                actions_for_curr_step_new = actions_for_curr_step
 
                         if outlier_kmeans:
                             actions_for_curr_step_new = remove_outliers_kmeans(actions_for_curr_step)
@@ -287,7 +330,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         
                         """
                         #original exponential weighting
-                        
+    
                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step_new)))
                         exp_weights = exp_weights / exp_weights.sum()
                         exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
@@ -328,6 +371,18 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
         if save_episode:
             save_videos(image_list, DT, video_path=os.path.join(ckpt_dir, f'video{rollout_id}.mp4'))
+            
+            # Generate Mahalanobis distance visualization if using MBIS
+            if outlier_mbis:
+                plot_path, data_path = visualizer.plot_mahalanobis_timeseries(
+                    task_name, 
+                    rollout_id,
+                    subtask_boundaries
+                )
+                print(f"Saved Mahalanobis visualization to {plot_path}")
+                print(f"Saved Mahalanobis data to {data_path}")
+                # Clear data for next episode
+                visualizer.clear_data()
 
     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
     avg_return = np.mean(episode_returns)
