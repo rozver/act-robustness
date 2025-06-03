@@ -18,6 +18,8 @@ from visualize_episodes import save_videos
 
 from sim_env import BOX_POSE
 
+from sklearn.cluster import KMeans
+
 import IPython
 e = IPython.embed
 
@@ -85,7 +87,11 @@ def main(args):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
-        'real_robot': not is_sim
+        'real_robot': not is_sim,
+        #CHANGES
+        'outlier_mbis': args['outlier_mbis'],
+        'outlier_kmeans': args['outlier_kmeans'],
+        'iqr_threshold': args['iqr_threshold']
     }
 
     if is_eval:
@@ -105,7 +111,7 @@ def main(args):
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
         os.makedirs(ckpt_dir)
-    stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
+    stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')       
     with open(stats_path, 'wb') as f:
         pickle.dump(stats, f)
 
@@ -149,7 +155,7 @@ def get_image(ts, camera_names):
 
 
 def eval_bc(config, ckpt_name, save_episode=True):
-    set_seed(1000)
+    set_seed(config['seed'])
     ckpt_dir = config['ckpt_dir']
     state_dim = config['state_dim']
     real_robot = config['real_robot']
@@ -160,6 +166,11 @@ def eval_bc(config, ckpt_name, save_episode=True):
     max_timesteps = config['episode_len']
     task_name = config['task_name']
     temporal_agg = config['temporal_agg']
+    #CHANGES:
+    outlier_mbis = config['outlier_mbis']
+    outlier_kmeans = config['outlier_kmeans']
+    iqr_threshold = config['iqr_threshold']
+
     onscreen_cam = 'angle'
 
     # load policy and stats
@@ -245,18 +256,44 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
                 ### query policy
                 if config['policy_class'] == "ACT":
+                    #Without temporal agg we will just take the latest action.
                     if t % query_frequency == 0:
                         all_actions = policy(qpos, curr_image)
                     if temporal_agg:
                         all_time_actions[[t], t:t+num_queries] = all_actions
-                        actions_for_curr_step = all_time_actions[:, t]
+                        actions_for_curr_step = all_time_actions[:, t] #all relevant actions at current timestep
+
                         actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
                         actions_for_curr_step = actions_for_curr_step[actions_populated]
                         k = 0.01
-                        exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
+
+                        #temporal agg quantile outlier removal 
+                        if outlier_mbis:
+                            actions_for_curr_step_new = remove_outliers_mbis(actions_for_curr_step, threshold=iqr_threshold, weighted=True)
+                            #if len(actions_for_curr_step_new) < len(actions_for_curr_step):
+                                #print(len(actions_for_curr_step_new), len(actions_for_curr_step))
+
+                        if outlier_kmeans:
+                            actions_for_curr_step_new = remove_outliers_kmeans(actions_for_curr_step)
+                        
+                        #linear weighting
+                        """
+                        N = actions_for_curr_step_new.shape[0]
+                        lin_w = torch.arange(1, N+1, dtype=torch.float32,
+                                            device=actions_for_curr_step_new.device)
+                        lin_w = lin_w / lin_w.sum()
+                        lin_w = lin_w.unsqueeze(1)  # [N,1]
+                        raw_action = (actions_for_curr_step_new * lin_w).sum(dim=0, keepdim=True)
+                        """
+
+                        #original exponential weighting
+                        
+                        exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step_new)))
                         exp_weights = exp_weights / exp_weights.sum()
                         exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
-                        raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
+                        raw_action = (actions_for_curr_step_new * exp_weights).sum(dim=0, keepdim=True)
+                        
+
                     else:
                         raw_action = all_actions[:, t % query_frequency]
                 elif config['policy_class'] == "CNNMLP":
@@ -412,6 +449,77 @@ def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
         plt.savefig(plot_path)
     print(f'Saved plots to {ckpt_dir}')
 
+#outlier removal it is likely that back actions need to be removed
+def remove_outliers_mbis(actions, threshold, weighted=True):
+    N, d = actions.shape
+    if N == 1:
+        return actions
+    
+    if weighted == True:
+        k = 0.08
+        exp_weights = np.exp(-k * np.arange(len(actions)))
+        exp_weights = exp_weights / exp_weights.sum()
+        exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+    else:
+        exp_weights = torch.full((N,1), 1.0/N, device=actions.device)
+
+    #calculate mean per action over batch
+    mu = (actions * exp_weights).sum(dim=0)
+
+    #calculate covariance matrix
+    X = actions - mu
+    cov = (X * exp_weights).T @ X
+    cov += torch.eye(d).cuda() * 1e-6 # for stability
+    inv_cov = torch.linalg.inv(cov)
+
+    #mahalanobis dist
+    diff = X.unsqueeze(1)               # [N, 1, d]
+    left = diff @ inv_cov                # [N, 1, d]
+    mbis_dists = (left * diff).sum(dim=(1,2))  # [N]
+    
+    q1, q3 = torch.quantile(mbis_dists, 0.25), torch.quantile(mbis_dists, 0.75)
+    iqr = q3 - q1
+    mask = (mbis_dists >= q1 - threshold*iqr) & (mbis_dists <= q3 + threshold*iqr)
+
+    clean_actions = actions[mask]
+    dropped_idx = torch.where(~mask)[0]                  # indices of rows removed
+
+    # Optional logging
+    if dropped_idx.numel() > 3:
+        print(f"Dropped {dropped_idx.numel()} outlier(s), at indices: {dropped_idx.tolist()}")
+
+    return clean_actions
+
+def remove_outliers_kmeans(actions, K=4, z_th=2.5):
+    N, d = actions.shape
+    if N <= K:
+        return actions
+
+    #because kmeans only takes np
+    device = actions.device
+    dtype  = actions.dtype
+    actions = actions.detach().cpu().numpy()
+
+    kmeans = KMeans(n_clusters=K, random_state=0, n_init=10).fit(actions)
+    centroids = kmeans.cluster_centers_
+    labels    = kmeans.labels_
+
+    #Threshold the clusters to remove outliers
+    dists = np.linalg.norm(actions - centroids[labels], axis=1)
+    mu, sigma = dists.mean(), dists.std()
+    mask = np.abs((dists - mu) / sigma) <= z_th
+    
+    #Remove clusters that are too small
+    counts = np.bincount(labels, minlength=K)
+    if counts.min() < N/2 * counts.max():
+        print(counts.min(), counts.max())
+    sorted_clusters = np.argsort(counts)
+    clusters_to_remove = sorted_clusters[:1]
+    mask = ~np.isin(labels, clusters_to_remove)
+
+    clean_actions_np = actions[mask]
+    clean_actions = torch.from_numpy(clean_actions_np).to(device=device, dtype=dtype)
+    return clean_actions
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -431,5 +539,11 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+    #CHANGES
+    parser.add_argument('--outlier_mbis', action='store_true')
+    parser.add_argument('--outlier_kmeans', action='store_true')
+
+    parser.add_argument('--iqr_threshold', action='store', type=float, help='IQR_threshold', required=False)
+
     
     main(vars(parser.parse_args()))
