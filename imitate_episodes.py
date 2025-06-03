@@ -18,6 +18,8 @@ from visualize_episodes import save_videos
 
 from sim_env import BOX_POSE
 
+from sklearn.cluster import KMeans
+
 import IPython
 e = IPython.embed
 
@@ -88,6 +90,7 @@ def main(args):
         'real_robot': not is_sim,
         #CHANGES
         'outlier_mbis': args['outlier_mbis'],
+        'outlier_kmeans': args['outlier_kmeans'],
         'iqr_threshold': args['iqr_threshold']
     }
 
@@ -165,6 +168,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
     temporal_agg = config['temporal_agg']
     #CHANGES:
     outlier_mbis = config['outlier_mbis']
+    outlier_kmeans = config['outlier_kmeans']
     iqr_threshold = config['iqr_threshold']
 
     onscreen_cam = 'angle'
@@ -265,26 +269,30 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
                         #temporal agg quantile outlier removal 
                         if outlier_mbis:
-                            actions_for_curr_step_new = remove_outliers_mbis(actions_for_curr_step, threshold=iqr_threshold)
+                            actions_for_curr_step_new = remove_outliers_mbis(actions_for_curr_step, threshold=iqr_threshold, weighted=True)
                             #if len(actions_for_curr_step_new) < len(actions_for_curr_step):
                                 #print(len(actions_for_curr_step_new), len(actions_for_curr_step))
 
-                        #if temporal_agg_kmeans:
-
+                        if outlier_kmeans:
+                            actions_for_curr_step_new = remove_outliers_kmeans(actions_for_curr_step)
                         
+                        #linear weighting
+                        """
                         N = actions_for_curr_step_new.shape[0]
                         lin_w = torch.arange(1, N+1, dtype=torch.float32,
                                             device=actions_for_curr_step_new.device)
                         lin_w = lin_w / lin_w.sum()
                         lin_w = lin_w.unsqueeze(1)  # [N,1]
                         raw_action = (actions_for_curr_step_new * lin_w).sum(dim=0, keepdim=True)
-                        
                         """
-                        exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
+
+                        #original exponential weighting
+                        
+                        exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step_new)))
                         exp_weights = exp_weights / exp_weights.sum()
                         exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
-                        raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
-                        """
+                        raw_action = (actions_for_curr_step_new * exp_weights).sum(dim=0, keepdim=True)
+                        
 
                     else:
                         raw_action = all_actions[:, t % query_frequency]
@@ -441,18 +449,26 @@ def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
         plt.savefig(plot_path)
     print(f'Saved plots to {ckpt_dir}')
 
-#outlier removal
-def remove_outliers_mbis(actions, threshold=1.5):
+#outlier removal it is likely that back actions need to be removed
+def remove_outliers_mbis(actions, threshold, weighted=True):
     N, d = actions.shape
     if N == 1:
         return actions
-        
+    
+    if weighted == True:
+        k = 0.08
+        exp_weights = np.exp(-k * np.arange(len(actions)))
+        exp_weights = exp_weights / exp_weights.sum()
+        exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+    else:
+        exp_weights = torch.full((N,1), 1.0/N, device=actions.device)
+
     #calculate mean per action over batch
-    mu = actions.mean(dim=0)
+    mu = (actions * exp_weights).sum(dim=0)
 
     #calculate covariance matrix
     X = actions - mu
-    cov = (X.T @ X)/(N-1)
+    cov = (X * exp_weights).T @ X
     cov += torch.eye(d).cuda() * 1e-6 # for stability
     inv_cov = torch.linalg.inv(cov)
 
@@ -469,11 +485,41 @@ def remove_outliers_mbis(actions, threshold=1.5):
     dropped_idx = torch.where(~mask)[0]                  # indices of rows removed
 
     # Optional logging
-    if dropped_idx.numel() > 5:
+    if dropped_idx.numel() > 3:
         print(f"Dropped {dropped_idx.numel()} outlier(s), at indices: {dropped_idx.tolist()}")
 
     return clean_actions
 
+def remove_outliers_kmeans(actions, K=4, z_th=2.5):
+    N, d = actions.shape
+    if N <= K:
+        return actions
+
+    #because kmeans only takes np
+    device = actions.device
+    dtype  = actions.dtype
+    actions = actions.detach().cpu().numpy()
+
+    kmeans = KMeans(n_clusters=K, random_state=0, n_init=10).fit(actions)
+    centroids = kmeans.cluster_centers_
+    labels    = kmeans.labels_
+
+    #Threshold the clusters to remove outliers
+    dists = np.linalg.norm(actions - centroids[labels], axis=1)
+    mu, sigma = dists.mean(), dists.std()
+    mask = np.abs((dists - mu) / sigma) <= z_th
+    
+    #Remove clusters that are too small
+    counts = np.bincount(labels, minlength=K)
+    if counts.min() < N/2 * counts.max():
+        print(counts.min(), counts.max())
+    sorted_clusters = np.argsort(counts)
+    clusters_to_remove = sorted_clusters[:1]
+    mask = ~np.isin(labels, clusters_to_remove)
+
+    clean_actions_np = actions[mask]
+    clean_actions = torch.from_numpy(clean_actions_np).to(device=device, dtype=dtype)
+    return clean_actions
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -495,6 +541,8 @@ if __name__ == '__main__':
     parser.add_argument('--temporal_agg', action='store_true')
     #CHANGES
     parser.add_argument('--outlier_mbis', action='store_true')
+    parser.add_argument('--outlier_kmeans', action='store_true')
+
     parser.add_argument('--iqr_threshold', action='store', type=float, help='IQR_threshold', required=False)
 
     
