@@ -277,22 +277,22 @@ def eval_bc(config, ckpt_name, save_episode=True):
                             actions_for_curr_step_new = remove_outliers_kmeans(actions_for_curr_step)
                         
                         #linear weighting
-                        """
+                        
                         N = actions_for_curr_step_new.shape[0]
                         lin_w = torch.arange(1, N+1, dtype=torch.float32,
                                             device=actions_for_curr_step_new.device)
                         lin_w = lin_w / lin_w.sum()
                         lin_w = lin_w.unsqueeze(1)  # [N,1]
                         raw_action = (actions_for_curr_step_new * lin_w).sum(dim=0, keepdim=True)
+                        
                         """
-
                         #original exponential weighting
                         
                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step_new)))
                         exp_weights = exp_weights / exp_weights.sum()
                         exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
                         raw_action = (actions_for_curr_step_new * exp_weights).sum(dim=0, keepdim=True)
-                        
+                        """
 
                     else:
                         raw_action = all_actions[:, t % query_frequency]
