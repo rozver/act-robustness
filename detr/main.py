@@ -9,6 +9,8 @@ from .models import build_ACT_model, build_CNNMLP_model
 import IPython
 e = IPython.embed
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float) # will be overridden
@@ -66,6 +68,7 @@ def get_args_parser():
     parser.add_argument('--outlier_mbis', action='store_true')
     parser.add_argument('--outlier_kmeans', action='store_true')
     parser.add_argument('--iqr_threshold', action='store', type=float, help='IQR_threshold', required=False)
+    parser.add_argument('--dynamic_chunks', action='store_true')
 
     return parser
 
@@ -78,7 +81,7 @@ def build_ACT_model_and_optimizer(args_override):
         setattr(args, k, v)
 
     model = build_ACT_model(args)
-    model.cuda()
+    model.to(device)
 
     param_dicts = [
         {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
@@ -101,7 +104,7 @@ def build_CNNMLP_model_and_optimizer(args_override):
         setattr(args, k, v)
 
     model = build_CNNMLP_model(args)
-    model.cuda()
+    model.to(device)
 
     param_dicts = [
         {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},

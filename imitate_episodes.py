@@ -23,6 +23,8 @@ from sklearn.cluster import KMeans
 import IPython
 e = IPython.embed
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 def main(args):
     set_seed(1)
     # command line parameters
@@ -91,7 +93,8 @@ def main(args):
         #CHANGES
         'outlier_mbis': args['outlier_mbis'],
         'outlier_kmeans': args['outlier_kmeans'],
-        'iqr_threshold': args['iqr_threshold']
+        'iqr_threshold': args['iqr_threshold'],
+        'dynamic_chunks': args['dynamic_chunks']
     }
 
     if is_eval:
@@ -150,7 +153,7 @@ def get_image(ts, camera_names):
         curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
         curr_images.append(curr_image)
     curr_image = np.stack(curr_images, axis=0)
-    curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)
+    curr_image = torch.from_numpy(curr_image / 255.0).float().to(device).unsqueeze(0)
     return curr_image
 
 
@@ -175,11 +178,21 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+    ref_ckpt_path = os.path.join('models/act_transfer_human', 'policy_best.ckpt')
+    
     policy = make_policy(policy_class, policy_config)
-    loading_status = policy.load_state_dict(torch.load(ckpt_path))
-    print(loading_status)
-    policy.cuda()
+    ref_policy = make_policy(policy_class, policy_config)
+
+    loading_status = policy.load_state_dict(torch.load(ckpt_path, map_location=device))
+    loading_status = ref_policy.load_state_dict(torch.load(ref_ckpt_path, map_location=device))
+
+    
+    policy.to(device)
     policy.eval()
+
+    ref_policy.to(device)
+    ref_policy.eval()
+
     print(f'Loaded: {ckpt_path}')
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
     with open(stats_path, 'rb') as f:
@@ -227,13 +240,15 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
         ### evaluation loop
         if temporal_agg:
-            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).cuda()
+            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).to(device)
 
-        qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
+        qpos_history = torch.zeros((1, max_timesteps, state_dim)).to(device)
         image_list = [] # for visualization
         qpos_list = []
         target_qpos_list = []
         rewards = []
+        chunk_step = 0
+        ratios = []
         with torch.inference_mode():
             for t in range(max_timesteps):
                 ### update onscreen render and wait for DT
@@ -250,15 +265,28 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     image_list.append({'main': obs['image']})
                 qpos_numpy = np.array(obs['qpos'])
                 qpos = pre_process(qpos_numpy)
-                qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
+                qpos = torch.from_numpy(qpos).float().to(device).unsqueeze(0)
                 qpos_history[:, t] = qpos
                 curr_image = get_image(ts, camera_names)
 
                 ### query policy
                 if config['policy_class'] == "ACT":
                     #Without temporal agg we will just take the latest action.
-                    if t % query_frequency == 0:
+                    if chunk_step == 0:
                         all_actions = policy(qpos, curr_image)
+                        if config['dynamic_chunks']:
+                            ref_actions = ref_policy(qpos, curr_image)
+
+                            diff = ref_actions - all_actions
+                            diff = diff[:, :10, :].abs().mean(dim=1).sum(dim=1).item()
+                            ratio = 1 - min(0.8, diff/5)
+                            query_frequency = max(1,
+                                int(policy_config['num_queries'] * ratio))
+
+                            ratios.append(ratio)
+                        else:
+                            query_frequency = policy_config['num_queries']
+                        
                     if temporal_agg:
                         all_time_actions[[t], t:t+num_queries] = all_actions
                         actions_for_curr_step = all_time_actions[:, t] #all relevant actions at current timestep
@@ -290,12 +318,16 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         
                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step_new)))
                         exp_weights = exp_weights / exp_weights.sum()
-                        exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+                        exp_weights = torch.from_numpy(exp_weights).to(device).unsqueeze(dim=1)
                         raw_action = (actions_for_curr_step_new * exp_weights).sum(dim=0, keepdim=True)
                         """
 
                     else:
-                        raw_action = all_actions[:, t % query_frequency]
+                        raw_action = all_actions[:, chunk_step]
+                        chunk_step += 1
+                        if chunk_step >= query_frequency:
+                            chunk_step = 0
+
                 elif config['policy_class'] == "CNNMLP":
                     raw_action = policy(qpos, curr_image)
                 else:
@@ -325,6 +357,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
         episode_highest_reward = np.max(rewards)
         highest_rewards.append(episode_highest_reward)
         print(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
+        print(ratios)
 
         if save_episode:
             save_videos(image_list, DT, video_path=os.path.join(ckpt_dir, f'video{rollout_id}.mp4'))
@@ -352,7 +385,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 def forward_pass(data, policy):
     image_data, qpos_data, action_data, is_pad = data
-    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
+    image_data, qpos_data, action_data, is_pad = image_data.to(device), qpos_data.to(device), action_data.to(device), is_pad.to(device)
     return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
 
 
@@ -366,7 +399,7 @@ def train_bc(train_dataloader, val_dataloader, config):
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
-    policy.cuda()
+    policy.to(device)
     optimizer = make_optimizer(policy_class, policy)
 
     train_history = []
@@ -459,7 +492,7 @@ def remove_outliers_mbis(actions, threshold, weighted=True):
         k = 0.08
         exp_weights = np.exp(-k * np.arange(len(actions)))
         exp_weights = exp_weights / exp_weights.sum()
-        exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+        exp_weights = torch.from_numpy(exp_weights).to(device).unsqueeze(dim=1)
     else:
         exp_weights = torch.full((N,1), 1.0/N, device=actions.device)
 
@@ -469,7 +502,7 @@ def remove_outliers_mbis(actions, threshold, weighted=True):
     #calculate covariance matrix
     X = actions - mu
     cov = (X * exp_weights).T @ X
-    cov += torch.eye(d).cuda() * 1e-6 # for stability
+    cov += torch.eye(d).to(device) * 1e-6 # for stability
     inv_cov = torch.linalg.inv(cov)
 
     #mahalanobis dist
@@ -544,6 +577,7 @@ if __name__ == '__main__':
     parser.add_argument('--outlier_kmeans', action='store_true')
 
     parser.add_argument('--iqr_threshold', action='store', type=float, help='IQR_threshold', required=False)
+    parser.add_argument('--dynamic_chunks', action='store_true')
 
     
     main(vars(parser.parse_args()))
