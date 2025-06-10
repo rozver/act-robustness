@@ -87,16 +87,6 @@ You can also add ``--onscreen_render`` to see real-time rendering during evaluat
 For real-world data where things can be harder to model, train for at least 5000 epochs or 3-4 times the length after the loss has plateaued.
 Please refer to [tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing) for more info.
 
-### Outlier detection
-    python3 imitate_episodes.py \
-    --task_name sim_transfer_cube_scripted \
-    --ckpt_dir <ckpt dir> \
-    --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 8 --dim_feedforward 3200 \
-    --num_epochs 2000  --lr 1e-5 \
-    --seed 0
-    --eval \
-    --outlier_mbis \
-    --iqr_threshold <threshold, e.g. 1.5>
 ### Dynamic Action Chunking
     python3 imitate_episodes.py \
     --task_name sim_transfer_cube_scripted \
@@ -106,3 +96,14 @@ Please refer to [tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkY
     --seed 0
     --eval \
     --dynamic_chunks
+
+### Outlier removal
+    python3 imitate_episodes.py \
+    --task_name sim_transfer_cube_scripted \
+    --ckpt_dir <ckpt dir> \
+    --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 8 --dim_feedforward 3200 \
+    --num_epochs 2000  --lr 1e-5 \
+    --seed 0
+    --eval \
+    --outlier_mbis \
+    --iqr_threshold <threshold, e.g. 1.5>
