@@ -89,21 +89,21 @@ Please refer to [tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkY
 
 ### Dynamic Action Chunking
     python3 imitate_episodes.py \
-    --task_name sim_transfer_cube_scripted \
+    --task_name sim_transfer_cube_human \
     --ckpt_dir <ckpt dir> \
     --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 8 --dim_feedforward 3200 \
     --num_epochs 2000  --lr 1e-5 \
-    --seed 0
+    --seed 0 \
     --eval \
     --dynamic_chunks
 
 ### Outlier removal
     python3 imitate_episodes.py \
-    --task_name sim_transfer_cube_scripted \
+    --task_name sim_transfer_cube_human \
     --ckpt_dir <ckpt dir> \
     --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 8 --dim_feedforward 3200 \
     --num_epochs 2000  --lr 1e-5 \
-    --seed 0
+    --seed 0 \
     --eval \
     --outlier_mbis \
     --iqr_threshold <threshold, e.g. 1.5>
